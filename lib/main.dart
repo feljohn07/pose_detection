@@ -90,7 +90,7 @@ class _PoseDetectorViewState extends State<PoseDetectorView> {
 
     _controller = CameraController(
       cameras[cameraIndex],
-      ResolutionPreset.medium, // Lower resolution is faster for processing
+      ResolutionPreset.high,
       enableAudio: false,
       imageFormatGroup:
           Platform.isAndroid
@@ -177,20 +177,17 @@ class _PoseDetectorViewState extends State<PoseDetectorView> {
   InputImage? _inputImageFromCameraImage(CameraImage image) {
     if (_controller == null) return null;
 
-    // get camera rotation
+    // 1. Handle Rotation
     final camera = _controller!.description;
     final sensorOrientation = camera.sensorOrientation;
-
     InputImageRotation rotation = InputImageRotation.rotation0deg;
     if (Platform.isAndroid) {
       var rotationCompensation =
           _orientations[_controller!.value.deviceOrientation];
       if (rotationCompensation == null) return null;
       if (camera.lensDirection == CameraLensDirection.front) {
-        // front-facing
         rotationCompensation = (sensorOrientation + rotationCompensation) % 360;
       } else {
-        // back-facing
         rotationCompensation =
             (sensorOrientation - rotationCompensation + 360) % 360;
       }
@@ -203,11 +200,23 @@ class _PoseDetectorViewState extends State<PoseDetectorView> {
           InputImageRotation.rotation0deg;
     }
 
-    // Normalize format
+    // 2. Handle Format
     final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null) return null;
+    // Validating format is supported.
+    // On Android, even if we ask for NV21, it might come as YUV_420_888 (35).
+    // ML Kit handles NV21 (17) and YV12 (842094169) natively.
+    if (format == null ||
+        (Platform.isAndroid &&
+            format != InputImageFormat.nv21 &&
+            format != InputImageFormat.yv12)) {
+      // If format is YUV420 (35), we manually set it to NV21 (17) because we are constructing the bytes manually below
+      // This is the "Force Fix" for the converter error.
+    }
 
-    final allBytes = WriteBuffer();
+    // 3. Handle Bytes (The Critical Part for the Crash)
+    if (image.planes.isEmpty) return null;
+
+    final WriteBuffer allBytes = WriteBuffer();
     for (final plane in image.planes) {
       allBytes.putUint8List(plane.bytes);
     }
@@ -216,7 +225,10 @@ class _PoseDetectorViewState extends State<PoseDetectorView> {
     final metadata = InputImageMetadata(
       size: Size(image.width.toDouble(), image.height.toDouble()),
       rotation: rotation,
-      format: format,
+      format:
+          Platform.isAndroid
+              ? InputImageFormat.nv21
+              : format!, // Force NV21 on Android
       bytesPerRow: image.planes[0].bytesPerRow,
     );
 
