@@ -1,34 +1,19 @@
 import 'dart:io';
-import 'dart:typed_data';
-
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 
-// Global variable to store available cameras
-List<CameraDescription> cameras = [];
+late List<CameraDescription> cameras;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   try {
     cameras = await availableCameras();
   } on CameraException catch (e) {
-    debugPrint('Error: ${e.code}, ${e.description}');
+    debugPrint('Error: $e.code\nError Message: $e.message');
   }
-  runApp(const MyApp());
-}
-
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return const MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: PoseDetectorView(),
-    );
-  }
+  runApp(const MaterialApp(home: PoseDetectorView()));
 }
 
 class PoseDetectorView extends StatefulWidget {
@@ -39,137 +24,174 @@ class PoseDetectorView extends StatefulWidget {
 }
 
 class _PoseDetectorViewState extends State<PoseDetectorView> {
-  CameraController? _controller;
-  bool _isBusy = false;
   final PoseDetector _poseDetector = PoseDetector(options: PoseDetectorOptions());
-  List<Pose> _poses = [];
+  bool _canProcess = true;
+  bool _isBusy = false;
   CustomPaint? _customPaint;
-  int _cameraIndex = 0;
+  CameraController? _controller;
+  
+  // DEBUG LOGGING STATE
+  final List<String> _logs = [];
+  String _realTimeStats = "Initializing...";
 
   @override
   void initState() {
     super.initState();
-    _startCamera();
+    _initializeCamera();
   }
 
   @override
   void dispose() {
-    _stopCamera();
+    _canProcess = false;
     _poseDetector.close();
+    _controller?.dispose();
     super.dispose();
   }
 
-  Future<void> _startCamera() async {
-    if (cameras.isEmpty) return;
+  /// Adds a message to the scrolling log at the bottom
+  void _log(String message) {
+    if (!mounted) return;
+    setState(() {
+      _logs.add("${DateTime.now().hour}:${DateTime.now().minute}:${DateTime.now().second} - $message");
+      if (_logs.length > 15) {
+        _logs.removeAt(0); // Keep list clean
+      }
+    });
+  }
 
-    final camera = cameras[_cameraIndex];
+  /// Updates the fixed stats display at the top
+  void _updateStats(String stats) {
+    if (!mounted) return;
+    setState(() {
+      _realTimeStats = stats;
+    });
+  }
+
+  void _initializeCamera() async {
+    _log("Searching for cameras...");
+    if (cameras.isEmpty) {
+      _log("No cameras found!");
+      return;
+    }
+
+    // Usually 0 is back, 1 is front. Let's try to find a front camera.
+    var cameraIndex = 0;
+    for (var i = 0; i < cameras.length; i++) {
+      if (cameras[i].lensDirection == CameraLensDirection.front) {
+        cameraIndex = i;
+        break;
+      }
+    }
+    
     _controller = CameraController(
-      camera,
-      ResolutionPreset.medium,
+      cameras[cameraIndex],
+      ResolutionPreset.medium, // Lower resolution is faster for processing
       enableAudio: false,
       imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21
-          : ImageFormatGroup.bgra8888,
+          ? ImageFormatGroup.nv21 // Android expects NV21
+          : ImageFormatGroup.bgra8888, // iOS expects BGRA
     );
 
     try {
       await _controller?.initialize();
-      if (!mounted) return;
-      
-      // Start streaming images for processing
-      _controller?.startImageStream(_processCameraImage);
-      setState(() {});
+      _log("Camera initialized.");
+      _startLiveFeed();
     } catch (e) {
-      debugPrint("Camera initialization error: $e");
+      _log("Camera error: $e");
     }
   }
 
-  Future<void> _stopCamera() async {
-    await _controller?.stopImageStream();
-    await _controller?.dispose();
-    _controller = null;
+  void _startLiveFeed() {
+    _controller?.startImageStream(_processImage);
+    _log("Live feed started.");
   }
 
-  void _flipCamera() {
-    setState(() {
-      _cameraIndex = (_cameraIndex + 1) % cameras.length;
-    });
-    _stopCamera().then((_) => _startCamera());
-  }
-
-  Future<void> _processCameraImage(CameraImage image) async {
-    if (_isBusy) return;
+  Future<void> _processImage(CameraImage image) async {
+    if (!_canProcess || _isBusy) return;
     _isBusy = true;
 
-    final inputImage = _inputImageFromCameraImage(image);
-    if (inputImage == null) {
-      _isBusy = false;
-      return;
-    }
-
     try {
+      final inputImage = _inputImageFromCameraImage(image);
+      if (inputImage == null) {
+        // _log("Failed to convert image."); // Commented out to avoid spamming logs
+        _isBusy = false;
+        return;
+      }
+
       final poses = await _poseDetector.processImage(inputImage);
-      
+
+      // --- DEBUGGING LOGIC START ---
+      String stats = "Img: ${image.width}x${image.height}\n"
+          "Poses detected: ${poses.length}";
+
+      if (poses.isNotEmpty) {
+        final pose = poses.first;
+        // Log the Nose coordinates as a sanity check
+        final nose = pose.landmarks[PoseLandmarkType.nose];
+        if (nose != null) {
+          stats += "\nNose: (${nose.x.toStringAsFixed(1)}, ${nose.y.toStringAsFixed(1)})";
+          stats += "\nConfidence: ${(nose.likelihood * 100).toStringAsFixed(1)}%";
+        }
+        
+        // Check if feet are visible
+        final leftFoot = pose.landmarks[PoseLandmarkType.leftFootIndex];
+        final rightFoot = pose.landmarks[PoseLandmarkType.rightFootIndex];
+        stats += "\nFeet visible: ${leftFoot != null ? 'L' : '-'}/${rightFoot != null ? 'R' : '-'}";
+      }
+      _updateStats(stats);
+      // --- DEBUGGING LOGIC END ---
+
       if (inputImage.metadata?.size != null &&
           inputImage.metadata?.rotation != null) {
         final painter = PosePainter(
           poses,
           inputImage.metadata!.size,
           inputImage.metadata!.rotation,
-          cameras[_cameraIndex].lensDirection,
+          _controller!.description.lensDirection,
         );
         _customPaint = CustomPaint(painter: painter);
       } else {
         _customPaint = null;
       }
-      
-      if (mounted) {
-        setState(() {});
-      }
     } catch (e) {
-      debugPrint("Error detecting poses: $e");
+      _log("Error processing image: $e");
     }
 
     _isBusy = false;
+    if (mounted) {
+      setState(() {});
+    }
   }
 
-  // --- Helper: Convert CameraImage to InputImage ---
   InputImage? _inputImageFromCameraImage(CameraImage image) {
     if (_controller == null) return null;
 
-    final camera = cameras[_cameraIndex];
+    // get camera rotation
+    final camera = _controller!.description;
     final sensorOrientation = camera.sensorOrientation;
     
-    InputImageRotation? rotation;
-    if (Platform.isIOS) {
-      rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
-    } else if (Platform.isAndroid) {
-      var rotationCompensation = _orientations[_controller!.value.deviceOrientation];
-      if (rotationCompensation == null) return null;
-      if (camera.lensDirection == CameraLensDirection.front) {
-        // Android front camera rotation needs to be inverted
-        rotationCompensation = (sensorOrientation + rotationCompensation) % 360;
-      } else {
-        rotationCompensation = (sensorOrientation - rotationCompensation + 360) % 360;
-      }
-      rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
+    InputImageRotation rotation = InputImageRotation.rotation0deg;
+    if (Platform.isAndroid) {
+       var rotationCompensation = _orientations[_controller!.value.deviceOrientation];
+       if (rotationCompensation == null) return null;
+       if (camera.lensDirection == CameraLensDirection.front) {
+         // front-facing
+         rotationCompensation = (sensorOrientation + rotationCompensation) % 360;
+       } else {
+         // back-facing
+         rotationCompensation = (sensorOrientation - rotationCompensation + 360) % 360;
+       }
+       rotation = InputImageRotationValue.fromRawValue(rotationCompensation) ?? InputImageRotation.rotation0deg;
+    } else if (Platform.isIOS) {
+       rotation = InputImageRotationValue.fromRawValue(sensorOrientation) ?? InputImageRotation.rotation0deg;
     }
 
-    if (rotation == null) return null;
-
+    // Normalize format
     final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null || (Platform.isAndroid && format != InputImageFormat.nv21) || (Platform.isIOS && format != InputImageFormat.bgra8888)) {
-       // Basic validation, though typical formats are nv21 (Android) and bgra8888 (iOS)
-       // You might need handling for yuv420 on newer Android implementations if nv21 isn't default
-    }
+    if (format == null) return null; 
 
-    // Combining planes
-    if (image.planes.length != 1 && format != InputImageFormat.nv21) return null; 
-
-    // This logic simplifies plane handling for the sake of the example. 
-    // Robust production apps use specific helpers for YUV420 splitting.
-    final WriteBuffer allBytes = WriteBuffer();
-    for (final Plane plane in image.planes) {
+    final allBytes = WriteBuffer();
+    for (final plane in image.planes) {
       allBytes.putUint8List(plane.bytes);
     }
     final bytes = allBytes.done().buffer.asUint8List();
@@ -177,14 +199,14 @@ class _PoseDetectorViewState extends State<PoseDetectorView> {
     final metadata = InputImageMetadata(
       size: Size(image.width.toDouble(), image.height.toDouble()),
       rotation: rotation,
-      format: format ?? InputImageFormat.nv21,
+      format: format,
       bytesPerRow: image.planes[0].bytesPerRow,
     );
 
     return InputImage.fromBytes(bytes: bytes, metadata: metadata);
   }
-
-  static final _orientations = {
+  
+  final _orientations = {
     DeviceOrientation.portraitUp: 0,
     DeviceOrientation.landscapeLeft: 90,
     DeviceOrientation.portraitDown: 180,
@@ -193,38 +215,84 @@ class _PoseDetectorViewState extends State<PoseDetectorView> {
 
   @override
   Widget build(BuildContext context) {
+    if (_controller == null || !_controller!.value.isInitialized) {
+      return Scaffold(
+          body: Center(child: Text("Initializing Camera...\n${_logs.join('\n')}")));
+    }
+
     return Scaffold(
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (_controller != null && _controller!.value.isInitialized)
-            CameraPreview(_controller!),
+          CameraPreview(_controller!),
           if (_customPaint != null) _customPaint!,
+          
+          // --- DEBUG OVERLAY START ---
+          
+          // Top Right: Real-time Stats
           Positioned(
-            bottom: 30,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: FloatingActionButton(
-                onPressed: _flipCamera,
-                child: const Icon(Icons.flip_camera_ios),
+            top: 40,
+            right: 10,
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.6),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                _realTimeStats,
+                style: const TextStyle(color: Colors.greenAccent, fontSize: 14, fontFamily: 'monospace'),
               ),
             ),
-          )
+          ),
+
+          // Bottom: Event Log
+          Positioned(
+            bottom: 20,
+            left: 10,
+            right: 10,
+            height: 150,
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.7),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("System Logs:", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  const Divider(color: Colors.white30, height: 8),
+                  Expanded(
+                    child: ListView.builder(
+                      reverse: true, 
+                      itemCount: _logs.length,
+                      itemBuilder: (context, index) {
+                        return Text(
+                          _logs[_logs.length - 1 - index],
+                          style: const TextStyle(color: Colors.white70, fontSize: 12),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          // --- DEBUG OVERLAY END ---
         ],
       ),
     );
   }
 }
 
-// --- Painter: Draws the Skeleton ---
 class PosePainter extends CustomPainter {
-  PosePainter(this.poses, this.absoluteImageSize, this.rotation, this.cameraLensDirection);
-
   final List<Pose> poses;
   final Size absoluteImageSize;
   final InputImageRotation rotation;
   final CameraLensDirection cameraLensDirection;
+
+  PosePainter(this.poses, this.absoluteImageSize, this.rotation, this.cameraLensDirection);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -233,62 +301,56 @@ class PosePainter extends CustomPainter {
       ..strokeWidth = 4.0
       ..color = Colors.green;
 
-    final leftPaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3.0
-      ..color = Colors.yellow;
-
-    final rightPaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3.0
-      ..color = Colors.blueAccent;
+    final landmarkPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..strokeWidth = 5.0
+      ..color = Colors.red;
 
     for (final pose in poses) {
       // Draw all landmarks
       pose.landmarks.forEach((_, landmark) {
         canvas.drawCircle(
-            Offset(
-              translateX(landmark.x, size, absoluteImageSize, rotation, cameraLensDirection),
-              translateY(landmark.y, size, absoluteImageSize, rotation, cameraLensDirection),
-            ),
-            1,
-            paint);
+          Offset(
+            translateX(landmark.x, size, absoluteImageSize, rotation, cameraLensDirection),
+            translateY(landmark.y, size, absoluteImageSize, rotation, cameraLensDirection),
+          ),
+          4,
+          landmarkPaint,
+        );
       });
 
-      // Define connections (Skeleton)
-      void paintLine(PoseLandmarkType type1, PoseLandmarkType type2, Paint paintType) {
-        final PoseLandmark joint1 = pose.landmarks[type1]!;
-        final PoseLandmark joint2 = pose.landmarks[type2]!;
-        canvas.drawLine(
-          Offset(
-              translateX(joint1.x, size, absoluteImageSize, rotation, cameraLensDirection),
-              translateY(joint1.y, size, absoluteImageSize, rotation, cameraLensDirection),
-          ),
-          Offset(
-              translateX(joint2.x, size, absoluteImageSize, rotation, cameraLensDirection),
-              translateY(joint2.y, size, absoluteImageSize, rotation, cameraLensDirection),
-          ),
-          paintType,
-        );
+      void paintLine(PoseLandmarkType type1, PoseLandmarkType type2) {
+        final PoseLandmark? joint1 = pose.landmarks[type1];
+        final PoseLandmark? joint2 = pose.landmarks[type2];
+        if (joint1 != null && joint2 != null) {
+          canvas.drawLine(
+              Offset(
+                  translateX(joint1.x, size, absoluteImageSize, rotation, cameraLensDirection),
+                  translateY(joint1.y, size, absoluteImageSize, rotation, cameraLensDirection)),
+              Offset(
+                  translateX(joint2.x, size, absoluteImageSize, rotation, cameraLensDirection),
+                  translateY(joint2.y, size, absoluteImageSize, rotation, cameraLensDirection)),
+              paint);
+        }
       }
 
-      // Draw arms
-      paintLine(PoseLandmarkType.leftShoulder, PoseLandmarkType.leftElbow, leftPaint);
-      paintLine(PoseLandmarkType.leftElbow, PoseLandmarkType.leftWrist, leftPaint);
-      paintLine(PoseLandmarkType.rightShoulder, PoseLandmarkType.rightElbow, rightPaint);
-      paintLine(PoseLandmarkType.rightElbow, PoseLandmarkType.rightWrist, rightPaint);
+      // Draw Arms
+      paintLine(PoseLandmarkType.leftShoulder, PoseLandmarkType.leftElbow);
+      paintLine(PoseLandmarkType.leftElbow, PoseLandmarkType.leftWrist);
+      paintLine(PoseLandmarkType.rightShoulder, PoseLandmarkType.rightElbow);
+      paintLine(PoseLandmarkType.rightElbow, PoseLandmarkType.rightWrist);
 
       // Draw Body
-      paintLine(PoseLandmarkType.leftShoulder, PoseLandmarkType.rightShoulder, paint);
-      paintLine(PoseLandmarkType.leftShoulder, PoseLandmarkType.leftHip, leftPaint);
-      paintLine(PoseLandmarkType.rightShoulder, PoseLandmarkType.rightHip, rightPaint);
-      paintLine(PoseLandmarkType.leftHip, PoseLandmarkType.rightHip, paint);
+      paintLine(PoseLandmarkType.leftShoulder, PoseLandmarkType.rightShoulder);
+      paintLine(PoseLandmarkType.leftShoulder, PoseLandmarkType.leftHip);
+      paintLine(PoseLandmarkType.rightShoulder, PoseLandmarkType.rightHip);
+      paintLine(PoseLandmarkType.leftHip, PoseLandmarkType.rightHip);
 
-      // Draw Legs
-      paintLine(PoseLandmarkType.leftHip, PoseLandmarkType.leftKnee, leftPaint);
-      paintLine(PoseLandmarkType.leftKnee, PoseLandmarkType.leftAnkle, leftPaint);
-      paintLine(PoseLandmarkType.rightHip, PoseLandmarkType.rightKnee, rightPaint);
-      paintLine(PoseLandmarkType.rightKnee, PoseLandmarkType.rightAnkle, rightPaint);
+      // Draw Legs (This was where the previous code cut off)
+      paintLine(PoseLandmarkType.leftHip, PoseLandmarkType.leftKnee);
+      paintLine(PoseLandmarkType.leftKnee, PoseLandmarkType.leftAnkle);
+      paintLine(PoseLandmarkType.rightHip, PoseLandmarkType.rightKnee);
+      paintLine(PoseLandmarkType.rightKnee, PoseLandmarkType.rightAnkle);
     }
   }
 
@@ -296,30 +358,32 @@ class PosePainter extends CustomPainter {
   bool shouldRepaint(covariant PosePainter oldDelegate) {
     return oldDelegate.poses != poses;
   }
+}
 
-  // Helper to map x-coordinate from image to screen
-  double translateX(double x, Size canvasSize, Size imageSize, InputImageRotation rotation, CameraLensDirection cameraLensDirection) {
-    switch (rotation) {
-      case InputImageRotation.rotation90deg:
-      case InputImageRotation.rotation270deg:
-        // When rotated, width matches height
-        return x * canvasSize.width / (Platform.isIOS ? imageSize.width : imageSize.height);
-      case InputImageRotation.rotation0deg:
-      case InputImageRotation.rotation180deg:
-        return x * canvasSize.width / imageSize.width;
-    }
+/// TRANSLATION HELPERS
+/// These map the coordinates from the camera image (e.g. 1920x1080) to the screen (e.g. 400x800)
+double translateX(double x, Size canvasSize, Size imageSize, InputImageRotation rotation, CameraLensDirection cameraLensDirection) {
+  switch (rotation) {
+    case InputImageRotation.rotation90deg:
+    case InputImageRotation.rotation270deg:
+      // When rotated 90/270, x corresponds to height
+      return x * canvasSize.width / (Platform.isIOS ? imageSize.width : imageSize.height);
+    case InputImageRotation.rotation0deg:
+    case InputImageRotation.rotation180deg:
+      // Standard orientation
+      return x * canvasSize.width / imageSize.width;
   }
+}
 
-  // Helper to map y-coordinate from image to screen
-  double translateY(double y, Size canvasSize, Size imageSize, InputImageRotation rotation, CameraLensDirection cameraLensDirection) {
-    switch (rotation) {
-      case InputImageRotation.rotation90deg:
-      case InputImageRotation.rotation270deg:
-        // When rotated, height matches width
-        return y * canvasSize.height / (Platform.isIOS ? imageSize.height : imageSize.width);
-      case InputImageRotation.rotation0deg:
-      case InputImageRotation.rotation180deg:
-        return y * canvasSize.height / imageSize.height;
-    }
+double translateY(double y, Size canvasSize, Size imageSize, InputImageRotation rotation, CameraLensDirection cameraLensDirection) {
+  switch (rotation) {
+    case InputImageRotation.rotation90deg:
+    case InputImageRotation.rotation270deg:
+      // When rotated 90/270, y corresponds to width
+      return y * canvasSize.height / (Platform.isIOS ? imageSize.height : imageSize.width);
+    case InputImageRotation.rotation0deg:
+    case InputImageRotation.rotation180deg:
+      // Standard orientation
+      return y * canvasSize.height / imageSize.height;
   }
 }
