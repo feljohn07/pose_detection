@@ -1,0 +1,45 @@
+name: Build Flutter APK
+
+# This workflow triggers on push to the main branch or manually
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout the repository code
+      - uses: actions/checkout@v4
+
+      # 2. Setup Java (Required for Android builds)
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      # 3. Setup Flutter
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3' # You can change this or use 'stable'
+          channel: 'stable'
+
+      # 4. Install dependencies
+      - name: Get Dependencies
+        run: flutter pub get
+
+      # 5. Build the APK (Release mode)
+      # Note: --no-shrink prevents R8 code shrinking issues common with ML Kit in some configs,
+      # though strictly optional if your ProGuard rules are set up.
+      - name: Build APK
+        run: flutter build apk --release --no-shrink
+
+      # 6. Upload the APK so you can download it from GitHub
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
